@@ -1,62 +1,118 @@
-/**
- * Import function triggers from their respective submodules:
- *
- * const {onCall} = require("firebase-functions/v2/https");
- * const {onDocumentWritten} = require("firebase-functions/v2/firestore");
- *
- * See a full list of supported triggers at https://firebase.google.com/docs/functions
- */
 
-const {setGlobalOptions, } = require("firebase-functions");
-const {onRequest} = require("firebase-functions/https");
 const logger = require("firebase-functions/logger");
-const functions = require("firebase-functions");
+const { onSchedule } = require("firebase-functions/v2/scheduler");
+const admin = require('firebase-admin')
 const sgMail = require("@sendgrid/mail");
+const { getLastWeeksNumbers, generateWeeklyReportHTML } = require('./helper');
+const { onRequest } = require("firebase-functions/https");
+const { defineSecret } = require("firebase-functions/params");
 
-const SENDGRID_API_KEY = "functions.config().sendgrid.key";
-sgMail.setApiKey(SENDGRID_API_KEY);
+// The es6-promise-pool to limit the concurrency of promises.
+const PromisePool = require("es6-promise-pool").default;
+// Maximum concurrent account deletions.
+const MAX_CONCURRENT = 3;
 
-// For cost control, you can set the maximum number of containers that can be
-// running at the same time. This helps mitigate the impact of unexpected
-// traffic spikes by instead downgrading performance. This limit is a
-// per-function limit. You can override the limit for each function using the
-// `maxInstances` option in the function's options, e.g.
-// `onRequest({ maxInstances: 5 }, (req, res) => { ... })`.
-// NOTE: setGlobalOptions does not apply to functions using the v1 API. V1
-// functions should each use functions.runWith({ maxInstances: 10 }) instead.
-// In the v1 API, each function can only serve one request per container, so
-// this will be the maximum concurrent request count.
-setGlobalOptions({ maxInstances: 10 });
+const sendGridKey = defineSecret('SEND_GRID_API_KEY')
+const sendGridEmail = defineSecret('SEND_GRID_EMAIL')
 
-// Create and deploy your first functions
-// https://firebase.google.com/docs/functions/get-started
+// Initialize Firebase Admin SDK
+if (!admin.apps.length) {
+  admin.initializeApp();
+}
+const db = admin.database();
 
-// exports.helloWorld = onRequest((request, response) => {
-//   logger.info("Hello logs!", {structuredData: true});
-//   response.send("Hello from Firebase!");
-// });
-
-
-exports.sendBulkEmails = functions.https.onCall(async (data, context) => {
-  const { subject, message, emailList} = data;
-
-
-  if (!emailList || !Array.isArray(emailList) || emailList.length === 0) {
-    throw new functions.https.HttpsError("invalid-argument", "Invalid email list");
+exports.addPartnerEmails = onRequest({ region: "us-central1" }, async (req, res) => {
+  // Allow only POST requests
+  if (req.method !== 'POST') {
+    return res.status(405).send('Method Not Allowed');
   }
 
-  const msg = emailList.map(email => ({
-    to: email,
-    from: "your-email@example.com", // Use your verified sender
-    subject: subject,
-    html: message
-  }));
+  const { userId, emails } = req.body;
+  logger.info("======[req.body]=====", req.body);
+
+  // Validate inputs
+  if (!userId || !Array.isArray(emails)) {
+    return res.status(400).json({
+      error: 'Invalid request: userId must be provided and emails must be an array',
+    });
+  }
 
   try {
-    await sgMail.send(msg, false); // Set to false to send as individual messages
-    return { success: true };
+    const userEmailsRef = db.ref(`providerEmails/${userId}`);
+
+    // Fetch existing emails
+    const snapshot = await userEmailsRef.once('value');
+    const existingEmails = snapshot.exists() ? snapshot.val() : [];
+
+    // Merge and ensure uniqueness
+    const mergedEmails = Array.from(new Set([...(existingEmails || []), ...emails]));
+
+    // Save updated list
+    await userEmailsRef.set(mergedEmails);
+
+    return res.status(200).json({
+      message: `Emails successfully added for user ${userId}`,
+      data: mergedEmails,
+    });
+
   } catch (error) {
-    console.error("Error sending email", error);
-    throw new functions.https.HttpsError("internal", "Email send failed");
+    logger.error('Error writing to database:', error);
+    return res.status(500).json({ error: 'Internal Server Error' });
   }
 });
+
+exports.emailSchedular = onSchedule("0 9 * * 1", async (context) => {
+
+  const SendGridKey = sendGridKey.value()
+  const SendGridEmail = sendGridEmail.value()
+
+  console.log("======[SendGridKey]=====", JSON.stringify(SendGridKey, null, 1))
+  console.log("======[SendGridEmail]=====", JSON.stringify(SendGridEmail, null, 1))
+
+  sgMail.setApiKey(SendGridKey)
+
+  const userAndEmails = await getProviderUsersAndEmails()
+  // console.log("======[userAndEmails]=====", JSON.stringify(userAndEmails, null, 1))
+  const userIDs = Object.keys(userAndEmails)
+  for (const userId of userIDs) {
+    const userWeeklyData = await db.ref(`users/${userId}/weeklyNumbers`).once('value');
+    const weeklyValue = await userWeeklyData.val()
+    if (!weeklyValue) {
+      continue
+    }
+    const result = getLastWeeksNumbers(weeklyValue)
+    if (Object.keys(result).length) {
+      console.log("======[result]=====", JSON.stringify(result, null, 1))
+      const emailBody = generateWeeklyReportHTML(result)
+      const userEmails = userAndEmails[userId]
+      console.log("======[emailBody]=====", JSON.stringify(emailBody, null, 1))
+      await sendEmail(SendGridEmail, userEmails, "Last Week Report", emailBody)
+
+    }
+  }
+
+  return { message: "Message" }
+
+});
+
+const getProviderUsersAndEmails = async () => {
+  const snapshot = await db.ref(`providerEmails`).once('value');
+  const values = snapshot.val();
+  return values
+}
+
+const sendEmail = async (senderMail, emails, subject, html) => {
+  try {
+    const msg = {
+      to: emails,
+      from: senderMail, // Use your verified sender
+      subject,
+      html
+    };
+
+    const res = await sgMail.send(msg, false); // Set to false to send as individual messages
+    console.log("======[res]=====", JSON.stringify(res, null, 1))
+  } catch (error) {
+    console.log("======[error SEND EMAIL error]=====", JSON.stringify(error?.message, null, 1))
+  }
+}
