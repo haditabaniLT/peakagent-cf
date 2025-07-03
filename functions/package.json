@@ -4,7 +4,7 @@
   "scripts": {
     "serve": "firebase emulators:start --only functions",
     "shell": "firebase functions:shell",
-    "start": "npm run shell",
+    "start": "node init && npm run shell",
     "deploy": "firebase deploy --only functions",
     "logs": "firebase functions:log"
   },
@@ -13,8 +13,10 @@
   },
   "main": "index.js",
   "dependencies": {
-    "firebase-admin": "^12.6.0",
-    "firebase-functions": "^6.0.1"
+    "firebase-functions": "^6.0.1",
+    "@sendgrid/mail": "^8.1.5",
+    "firebase-admin": "^13.4.0",
+    "es6-promise-pool": "^2.5.0"
   },
   "devDependencies": {
     "firebase-functions-test": "^3.1.0"
